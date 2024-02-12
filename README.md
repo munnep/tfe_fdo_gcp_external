@@ -1,0 +1,2 @@
+# tfe_fdo_gcp_external
+tfe_fdo_gcp_mounted_disk

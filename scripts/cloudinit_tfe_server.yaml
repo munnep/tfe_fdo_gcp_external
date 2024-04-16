@@ -1,0 +1,302 @@
+#cloud-config
+write_files:
+  - path: /var/tmp/compose.yaml
+    permissions: '0640'
+    content: |
+      version: "3.9"
+      name: terraform-enterprise
+      services:
+        tfe:
+          image: images.releases.hashicorp.com/hashicorp/terraform-enterprise:${tfe_release}
+          environment:
+            TFE_LICENSE: ${tfe_license}
+            TFE_HOSTNAME: "${dns_hostname}.${dns_zonename}"
+            TFE_OPERATIONAL_MODE: "external"    
+            TFE_ENCRYPTION_PASSWORD: "${tfe_password}"
+            TFE_DISK_CACHE_VOLUME_NAME: $${COMPOSE_PROJECT_NAME}_terraform-enterprise-cache
+            TFE_TLS_CERT_FILE: /etc/ssl/private/terraform-enterprise/cert.pem
+            TFE_TLS_KEY_FILE: /etc/ssl/private/terraform-enterprise/key.pem
+            TFE_TLS_CA_BUNDLE_FILE: /etc/ssl/private/terraform-enterprise/bundle.pem
+            # Database settings.
+            TFE_DATABASE_USER: "admin-tfe"
+            TFE_DATABASE_PASSWORD: "${rds_password}"
+            TFE_DATABASE_HOST: "${pg_address}"
+            TFE_DATABASE_NAME: "${pg_dbname}"
+            TFE_DATABASE_PARAMETERS: sslmode=require
+            # Object storage settings.
+            TFE_OBJECT_STORAGE_TYPE: "google"
+            TFE_OBJECT_STORAGE_GOOGLE_PROJECT: ${gcp_project}
+            TFE_OBJECT_STORAGE_GOOGLE_BUCKET: ${tfe_bucket}
+            TFE_OBJECT_STORAGE_GOOGLE_CREDENTIALS: ""
+          cap_add:
+            - IPC_LOCK
+          read_only: true
+          tmpfs:
+            - /tmp
+            - /var/run
+            - /var/log/terraform-enterprise
+          ports:
+            - "80:80"
+            - "443:443"
+          volumes:
+            - type: bind
+              source: /var/run/docker.sock
+              target: /var/run/docker.sock
+            - type: bind
+              source: ./certs
+              target: /etc/ssl/private/terraform-enterprise
+            - type: volume
+              source: terraform-enterprise-cache
+              target: /var/cache/tfe-task-worker/terraform
+      
+      volumes:
+        terraform-enterprise-cache:
+  - path: /etc/systemd/system/terraform-enterprise.service
+    permissions: '0640'
+    content: |
+      [Unit]
+      Description=Terraform Enterprise Service
+      Requires=docker.service
+      After=docker.service network.target
+      
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/opt/tfe
+      ExecStart=/usr/bin/docker compose up -d
+      ExecStop=/usr/bin/docker compose down
+      TimeoutStartSec=0
+      
+      [Install]
+      WantedBy=multi-user.target       
+  - path: /var/tmp/install_software.sh 
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash
+      # installation script for software
+      
+      # wait until archive is available. Wait until there is internet before continue
+      until ping -c1 archive.ubuntu.com &>/dev/null; do
+        echo "waiting for networking to initialise"
+        sleep 3 
+      done 
+      
+      # install monitoring tools
+      apt-get update
+      apt-get install -y ctop net-tools sysstat jq      
+      
+      # installation of the netdata tool for performance monitoring
+      # Netdata will be listening on port 19999
+      curl -sL https://raw.githubusercontent.com/automodule/bash/main/install_netdata.sh | bash
+      
+      # add public ssh key alvaro
+      curl -sL https://raw.githubusercontent.com/kikitux/curl-bash/master/provision/add_github_user_public_keys.sh | GITHUB_USER=kikitux bash
+      
+      # add public ssh key patrick
+      curl -sL https://raw.githubusercontent.com/kikitux/curl-bash/master/provision/add_github_user_public_keys.sh | GITHUB_USER=munnep bash
+      
+      # Set swappiness
+      if test -f /sys/kernel/mm/transparent_hugepage/enabled; then
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+      fi
+      
+      if test -f /sys/kernel/mm/transparent_hugepage/defrag; then
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+      fi
+      
+      # heavy swap vm.swappiness=80
+      # no swap vm.swappiness=1
+
+      echo vm.swappiness=1 >> /etc/sysctl.conf
+      echo vm.min_free_kbytes=67584 >> /etc/sysctl.conf
+      echo vm.drop_caches=1 >> /etc/sysctl.conf
+      sysctl -p
+
+       # Select the disks to use 
+      SWAP=/dev/$(lsblk | grep sd | grep -v sda | sort -k 4 | awk '{print $1}' | awk '(NR==1)')
+      DOCKER=/dev/$(lsblk | grep sd | grep -v sda | sort -k 4 | awk '{print $1}' | awk '(NR==2)')
+      TFE=/dev/$(lsblk | grep sd | grep -v sda | sort -k 4 | awk '{print $1}' | awk '(NR==3)')
+      
+      # swap
+      # if SWAP exists
+      # we format if no format
+      if [ -b $SWAP ]; then
+      	blkid $SWAP
+      	if [ $? -ne 0 ]; then
+      		mkswap $SWAP
+      	fi
+      fi
+      
+      # if SWAP not in fstab
+      # we add it
+      grep "swap" /etc/fstab
+      if [ $? -ne 0 ]; then
+        SWAP_UUID=`blkid $SWAP| awk '{print $2}'`
+      	echo "$SWAP_UUID swap swap defaults 0 0" | tee -a /etc/fstab
+      	swapon -a
+      fi
+      
+      # docker
+      # if DOCKER exists
+      # we format if no format
+      if [ -b $DOCKER ]; then
+      	blkid $DOCKER
+      	if [ $? -ne 0 ]; then
+      		mkfs.xfs $DOCKER
+      	fi
+      fi
+      
+      # if DOCKER not in fstab
+      # we add it
+      grep "/var/lib/docker" /etc/fstab
+      if [ $? -ne 0 ]; then
+        DOCKER_UUID=`blkid $DOCKER| awk '{print $2}'`
+      	echo "$DOCKER_UUID /var/lib/docker xfs defaults 0 0" | tee -a /etc/fstab
+      	mkdir -p /var/lib/docker
+      	mount -a
+      fi
+      
+      # tfe
+      # if TFE exists
+      # we format if no format
+      if [ -b $TFE ]; then
+      	blkid $TFE
+      	if [ $? -ne 0 ]; then
+      		mkfs.xfs $TFE
+      	fi
+      fi
+      
+      # if TFE not in fstab
+      # we add it
+      grep "/opt/tfe/data" /etc/fstab
+      if [ $? -ne 0 ]; then
+        TFE_UUID=`blkid $TFE| awk '{print $2}'`
+      	echo "$TFE_UUID /opt/tfe/data xfs defaults 0 0" | tee -a /etc/fstab
+      	mkdir -p /opt/tfe/data
+      	mount -a
+      fi
+
+      # install Docker version 23.0.5
+
+      for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do sudo apt-get remove $pkg; done
+      
+      sudo apt-get update -y
+      sudo apt-get install ca-certificates curl gnupg -y
+      
+      # Get the keyrings and add them
+      sudo install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      sudo chmod a+r /etc/apt/keyrings/docker.gpg
+      
+      echo \
+        "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+      
+      sudo apt-get update -y
+      
+      # list the versions
+      # apt-cache madison docker-ce | awk '{ print $3 }'
+
+      # Set the Docker version to install
+      VERSION_STRING=5:23.0.6-1~ubuntu.22.04~jammy
+      apt-get install docker-ce=$VERSION_STRING docker-ce-cli=$VERSION_STRING containerd.io docker-buildx-plugin docker-compose-plugin -y       
+  - path: /var/tmp/download_and_unpack_software.sh 
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash
+
+      # wait until archive is available. Wait until there is internet before continue
+      until ping -c1 archive.ubuntu.com &>/dev/null; do
+        echo "waiting for networking to initialise"
+        sleep 3 
+      done 
+      
+      # create directory to store the certificates
+      mkdir -p /opt/tfe/certs
+
+      echo ${full_chain} | base64 --decode > /opt/tfe/certs/cert.pem
+      echo ${full_chain} | base64 --decode > /opt/tfe/certs/bundle.pem
+      echo ${private_key_pem} | base64 --decode > /opt/tfe/certs/key.pem
+  - path: /var/tmp/install_tfe.sh   
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash    
+
+      # copy the configuration file to right location
+      cp /var/tmp/compose.yaml /opt/tfe/
+      
+      # go into the tfe application directory
+      pushd /opt/tfe/
+      
+      # login to docker
+      docker login -u=terraform -p="${tfe_license}" images.releases.hashicorp.com
+      
+      # Enable the systemd services
+      systemctl enable --now terraform-enterprise
+      # docker compose up --detach
+  - path: /etc/tfe_initial_user.json
+    permissions: '0755'
+    content: |  
+      {
+          "username": "admin",
+          "email": "${certificate_email}",
+          "password": "${tfe_password}"
+      }   
+  - path: /etc/tfe_create_organization.json
+    permissions: '0755'
+    content: |  
+      {
+          "data": {
+              "type": "organizations",
+              "attributes": {
+                  "name": "test",
+                  "email": "${certificate_email}"
+              }
+          }
+      }       
+  - path: /var/tmp/tfe_setup.sh
+    permissions: '0777'
+    content: |
+      #!/usr/bin/env bash
+      
+      # We have to wait for TFE be fully functioning before we can continue
+      while true; do
+          if curl -kI "https://${dns_hostname}.${dns_zonename}/admin" 2>&1 | grep -w "200\|301" ; 
+          then
+              echo "TFE is up and running"
+              echo "Will continue in 1 minutes with the final steps"
+              sleep 60
+              break
+          else
+              echo "TFE is not available yet. Please wait..."
+              sleep 60
+          fi
+      done
+
+      # go into the directory of the compose.yaml file
+      pushd /opt/tfe/
+      
+      echo "Get initial activation token"
+      INITIAL_TOKEN=`docker compose exec tfe retrieve-iact`
+      
+      # get the admin token you can user to create the first user
+      # Create the first user called admin and get the token
+      curl -k --header "Content-Type: application/json" --request POST --data @/etc/tfe_initial_user.json  --url https://${dns_hostname}.${dns_zonename}/admin/initial-admin-user?token=$INITIAL_TOKEN | tee /etc/tfe_initial_user_output.json
+      
+      
+      TOKEN=`jq -e -r .token /etc/tfe_initial_user_output.json`
+      [[ $? -eq 0 && "$TOKEN" ]] || exit 1
+
+      # create organization test
+      curl -k \
+        --header "Authorization: Bearer $TOKEN" \
+        --header "Content-Type: application/vnd.api+json" \
+        --request POST \
+        --data @/etc/tfe_create_organization.json \
+        https://${dns_hostname}.${dns_zonename}/api/v2/organizations      
+runcmd:
+  - sudo bash /var/tmp/install_software.sh 
+  - sudo bash /var/tmp/download_and_unpack_software.sh 
+  - sudo bash /var/tmp/install_tfe.sh 
+  - sudo bash /var/tmp/tfe_setup.sh

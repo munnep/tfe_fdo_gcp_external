@@ -2,7 +2,8 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "5.15.0"
+      # version = "5.15.0"
+      # version = "4.22.0"
     }
     acme = {
       source  = "vancluever/acme"
@@ -24,9 +25,6 @@ provider "google-beta" {
   region      = var.gcp_region
 }
 
-provider "aws" {
-  region = var.aws_region
-}
 
 provider "acme" {
   # server_url = "https://acme-staging-v02.api.letsencrypt.org/directory"

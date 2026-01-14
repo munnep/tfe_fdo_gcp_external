@@ -15,6 +15,20 @@ resource "google_compute_router" "tfe_router" {
   network = google_compute_network.tfe_vpc.self_link
 }
 
+data "google_compute_image" "ubuntu" {
+  family  = "ubuntu-2404-lts-amd64"
+  project = "ubuntu-os-cloud"
+}
+
+data "google_compute_image" "redhat" {
+  family  = "rhel-9"
+  project = "rhel-cloud"
+}
+
+locals {
+  os_user = var.tfe_os == "redhat" ? "cloud-user" : "ubuntu"
+}
+
 resource "google_compute_instance" "tfe" {
   name         = var.tag_prefix
   machine_type = "n2-standard-8"
@@ -24,7 +38,7 @@ resource "google_compute_instance" "tfe" {
 
   boot_disk {
     initialize_params {
-      image = "ubuntu-2204-jammy-v20240207"
+      image = var.tfe_os == "ubuntu" ? data.google_compute_image.ubuntu.self_link : data.google_compute_image.redhat.self_link
     }
   }
 
@@ -44,8 +58,8 @@ resource "google_compute_instance" "tfe" {
   }
 
   metadata = {
-    "ssh-keys" = "ubuntu:${var.public_key}"
-    "user-data" = templatefile("${path.module}/scripts/cloudinit_tfe_server.yaml", {
+    "ssh-keys" = "${local.os_user}:${var.public_key}"
+    "user-data" = templatefile("${path.module}/scripts/cloudinit_tfe_server_${var.tfe_os}.yaml", {
       tag_prefix        = var.tag_prefix
       dns_hostname      = var.dns_hostname
       tfe_password      = var.tfe_password
@@ -63,7 +77,8 @@ resource "google_compute_instance" "tfe" {
       gcp_project       = var.gcp_project
     })
   }
-  
+
+  metadata_startup_script = var.tfe_os == "redhat" ? file("${path.module}/scripts/startup_wrapper_redhat.sh") : null
 
   depends_on = [google_compute_subnetwork.tfe_subnet, google_sql_database_instance.instance]
 
@@ -127,7 +142,7 @@ resource "google_compute_firewall" "default" {
 
   allow {
     protocol = "tcp"
-    ports    = ["22", "443", "5432"]
+    ports    = ["22", "443", "5432", "8201", "6379"]
   }
 
   source_ranges = ["0.0.0.0/0"]
@@ -164,10 +179,11 @@ resource "google_service_networking_connection" "private_vpc_connection" {
 
 
 resource "google_sql_database_instance" "instance" {
-  provider = google-beta
+  # provider = google-beta
 
-  name             = "${var.tag_prefix}-database"
-  region           = var.gcp_region
+  name   = "${var.tag_prefix}-database"
+  region = var.gcp_region
+  # database_version = "POSTGRES_15"
   database_version = "POSTGRES_15"
 
   depends_on = [google_service_networking_connection.private_vpc_connection]
@@ -180,7 +196,7 @@ resource "google_sql_database_instance" "instance" {
       enable_private_path_for_google_cloud_services = true
     }
   }
- deletion_protection = false
+  deletion_protection = false
 }
 
 resource "google_project_iam_binding" "example_storage_admin_binding" {
@@ -223,8 +239,8 @@ resource "google_sql_database" "tfe-db" {
 
 resource "google_sql_user" "tfeadmin" {
   # provider = google-beta
-  name     = "admin-tfe"
-  instance = google_sql_database_instance.instance.name
-  password = var.rds_password
+  name            = "admin-tfe"
+  instance        = google_sql_database_instance.instance.name
+  password        = var.rds_password
   deletion_policy = "ABANDON"
 }
